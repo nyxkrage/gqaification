@@ -1,0 +1,15 @@
+Distill Phase:
+1B total
+
+205M Erebus (Mielikki/Erebus-87k)
+125M Wikitext (Salesforce/wikitext)
+10M MATH (if001/open_web_math_small)
+100M Code (codeparrot/codeparrot-clean)
+150M Books (Geralt-Targaryen/books3)
+50M StackOverflow (mikex86/stackoverflow-posts)
+40M OpenSubtitles (dim/opensubtitles_clean_v1)
+20M PubMed (MedRAG/pubmed)
+300M CommonCrawl (allenai/c4)
+
+Correction Phase
+50M subset of distillation datamix
