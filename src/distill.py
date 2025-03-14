@@ -278,6 +278,10 @@ def main():
 
     # Start training
     trainer.train()
+    trainer.save_model()
+    if accelerator.is_main_process:
+        tokenizer.save_pretrained(f"./models/{MODEL_NAME.replace('/', '_')}-Corrected")
+    accelerator.wait_for_everyone()
 
 
 if __name__ == "__main__":
