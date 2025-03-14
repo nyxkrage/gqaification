@@ -6,13 +6,18 @@ from transformers import (
     Trainer,
     TrainingArguments,
     TrainerCallback,
+    get_cosine_schedule_with_warmup,
 )
-from datasets import Dataset
-from loss import ForwardKLLoss
+from datasets import Dataset, concatenate_datasets
+from lib.loss import ForwardKLLoss
+from lib.muon import Muon
 from accelerate import Accelerator
 from lm_eval import evaluator
 from lm_eval.models.huggingface import HFLM
 from constants import MODEL_NAME
+
+torch._dynamo.config.capture_scalar_outputs = True
+
 
 # Custom Trainer for logit distillation
 class DistillationTrainer(Trainer):
@@ -21,41 +26,44 @@ class DistillationTrainer(Trainer):
         self.teacher_model = self.accelerator.prepare(teacher_model)
         self.teacher_model.eval()
         self.kd_loss = ForwardKLLoss()
-        
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+
+    def compute_loss(
+        self, model, inputs, return_outputs=False, num_items_in_batch=None
+    ):
         inputs = {k: v.to(device=self.accelerator.device) for k, v in inputs.items()}
         labels = inputs["labels"]
         input_ids = inputs["input_ids"]
         attention_mask = inputs["attention_mask"]
         # Get student outputs
-        student_outputs = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask
-        )
-        
+        student_outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+
         # Get teacher outputs with automatic device placement
         with torch.no_grad():
             teacher_outputs = self.teacher_model(
                 input_ids=input_ids.to(device=self.teacher_model.device),
                 attention_mask=attention_mask.to(device=self.teacher_model.device),
             )
-        loss = self.kd_loss(student_outputs.logits, teacher_outputs.logits, labels) / self.args.gradient_accumulation_steps
-        
+        loss = (
+            self.kd_loss(student_outputs.logits, teacher_outputs.logits, labels)
+            / self.args.gradient_accumulation_steps
+        )
+
         return (loss, student_outputs) if return_outputs else loss
-    
+
+
 class AccelerateHFLM(HFLM):
     def __init__(
-            self,
-            model,
-            accelerator,
-            tokenizer,
-            truncation = False,
-            logits_cache = True,
-            max_length = None,
-            max_batch_size = 64,
-            add_bos_token = False,
-            batch_size = 1,
-        ):
+        self,
+        model,
+        accelerator,
+        tokenizer,
+        truncation=False,
+        logits_cache=True,
+        max_length=None,
+        max_batch_size=64,
+        add_bos_token=False,
+        batch_size=1,
+    ):
         super(type(self).__bases__[0], self).__init__()
         self._model = model
         self.accelerator = accelerator
@@ -96,20 +104,21 @@ class AccelerateHFLM(HFLM):
                 return sum(p.numel() for p in model.parameters())
             else:
                 return -1
-        
+
         def get_model_dtype(model) -> str:
             if hasattr(model, "dtype"):
                 return model.dtype
             else:
                 return ""
-            
+
         model_info = {
             "model_num_parameters": get_model_num_params(self.model),
             "model_dtype": get_model_dtype(self.model),
             "model_name": self.model.name_or_path,
         }
-        
+
         return model_info
+
 
 # PIQA evaluation callback using lm-eval-harness
 class PIQACallback(TrainerCallback):
@@ -118,7 +127,7 @@ class PIQACallback(TrainerCallback):
         self.trainer = trainer
         self.tokenizer = tokenizer
         self.eval_steps = eval_steps
-        
+
     def on_step_end(self, args, state, control, **kwargs):
         if state.global_step % self.eval_steps == 0 and state.global_step > 0:
             self.trainer.model.eval()
@@ -127,37 +136,36 @@ class PIQACallback(TrainerCallback):
                 self.evaluate_piqa(model)
             self.trainer.accelerator.wait_for_everyone()
         return control
-    
+
     def evaluate_piqa(self, model):
-            wrapper = HFLM(
-                pretrained=model,
-                parallelize=False,
-                tokenizer=self.tokenizer,
-            )
+        wrapper = HFLM(
+            pretrained=model,
+            parallelize=False,
+            tokenizer=self.tokenizer,
+        )
 
-            results = evaluator.simple_evaluate(
-                model=wrapper,
-                tasks=["piqa"],
-                batch_size=4,
-                num_fewshot=0,
-            )
+        results = evaluator.simple_evaluate(
+            model=wrapper,
+            tasks=["piqa"],
+            batch_size=4,
+            num_fewshot=0,
+        )
 
-            self.model.train()
-        
-            self.trainer.log({
-                "eval/piqa": results["results"]["piqa"]["acc,none"]
-            })
+        self.model.train()
+
+        self.trainer.log({"eval/piqa": results["results"]["piqa"]["acc,none"]})
+
 
 def main():
     accelerator = Accelerator()
-    
+
     # Load models with flash attention and device_map="auto"
     teacher = AutoModelForCausalLM.from_pretrained(
         f"./models/{MODEL_NAME.replace('/', '_')}-Corrected",
         attn_implementation="flash_attention_2",
         torch_dtype=torch.bfloat16,
     )
-    
+
     student = AutoLigerKernelForCausalLM.from_pretrained(
         f"./models/{MODEL_NAME.replace('/', '_')}-Pruned",
         attn_implementation="flash_attention_2",
@@ -166,27 +174,72 @@ def main():
         rms_norm=True,
         swiglu=True,
     )
-    
+
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, padding_side="left")
     tokenizer.pad_token = tokenizer.eos_token
-    
+
     # Prepare dataset
-    tokenized_dataset = Dataset.load_from_disk("datasets/distillation")
-    
+    tokenized_dataset = concatenate_datasets(
+        [
+            Dataset.load_from_disk("./datasets/dclm_800m"),
+            Dataset.load_from_disk("./datasets/thestack_200m"),
+        ]
+    ).shuffle()
+
     # Calculate evaluation steps
-    batch_size = 1
-    grad_accum_steps = 2
+    batch_size = 2
+    grad_accum_steps = 16
     num_devices = accelerator.num_processes
-    steps_per_epoch = len(tokenized_dataset) // (batch_size * grad_accum_steps * num_devices)
+    num_epochs = 1
+    steps_per_epoch = len(tokenized_dataset) // (
+        batch_size * grad_accum_steps * num_devices
+    )
     eval_steps = max(1, steps_per_epoch // 4)
-    
+
+    learning_rate = 4e-4
+    weight_decay = 0.1
+    warmup_steps = 100
+
+    # freeze all but attention layers
+    for name, param in student.named_parameters():
+        if "self_attn" not in name:
+            param.requires_grad = False
+
+    muon_params = [
+        p
+        for name, p in student.named_parameters()
+        if p.ndim >= 2
+        and "embed_tokens" not in name
+        and "lm_head" not in name
+        and p.requires_grad
+    ]
+    adamw_params = [
+        p
+        for name, p in student.named_parameters()
+        if not (p.ndim >= 2 and "embed_tokens" not in name and "lm_head" not in name)
+        and p.requires_grad
+    ]
+
+    optimizer = Muon(
+        lr=learning_rate,
+        wd=weight_decay,
+        muon_params=muon_params,
+        adamw_params=adamw_params,
+    )
+
+    lr_scheduler = get_cosine_schedule_with_warmup(
+        optimizer=optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=steps_per_epoch * num_epochs,
+    )
+
     # Configure training arguments
     training_args = TrainingArguments(
         output_dir=f"./models/{MODEL_NAME.replace('/', '_')}-GQA",
         learning_rate=4e-4,
         gradient_accumulation_steps=grad_accum_steps,
-        num_train_epochs=1,
+        num_train_epochs=num_epochs,
         per_device_train_batch_size=batch_size,
         eval_strategy="no",
         logging_steps=1,
@@ -194,7 +247,6 @@ def main():
         warmup_steps=1000,
         bf16=True,
         weight_decay=0.01,
-        optim="adamw_bnb_8bit",
         gradient_checkpointing=True,
         report_to=None,
         save_strategy="steps",
@@ -206,15 +258,16 @@ def main():
         torch_compile_backend="inductor",
         dataloader_num_workers=8,
     )
-    
+
     # Initialize trainer
     trainer = DistillationTrainer(
         model=student,
         teacher_model=teacher,
         args=training_args,
+        optimizers=(optimizer, lr_scheduler),
         train_dataset=tokenized_dataset,
     )
-    
+
     # LmEval callback currently doesn't work and causes as deadlock/NCCL to hang
     # Add PIQA evaluation callback
     # trainer.add_callback(PIQACallback(
@@ -225,6 +278,7 @@ def main():
 
     # Start training
     trainer.train()
+
 
 if __name__ == "__main__":
     main()

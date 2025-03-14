@@ -1,28 +1,28 @@
 import torch
-from torch import Tensor
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from dataset_loader import load_datasets_from_json
+from datasets import Dataset, concatenate_datasets
 import pickle
 from tqdm import tqdm
-from typing import Dict, List, Literal
+from constants import MODEL_NAME
 
 # Configuration
-MODEL_NAME = './models/'
-DATASET_CONFIG = None
-SPLIT = 'train'
-BATCH_SIZE = 16
+BATCH_SIZE = 8
 MAX_SAMPLES = 1024  # Number of samples to process
 
 # Load the dataset
-dataset = load_datasets_from_json("dataset_configs_correction.json")
+dataset = concatenate_datasets(
+    [
+        Dataset.load_from_disk("./datasets/dclm_40m"),
+        Dataset.load_from_disk("./datasets/thestack_10m"),
+    ]
+).shuffle()
 dataset = dataset.select(range(MAX_SAMPLES))  # Limit the number of samples
-dataset = dataset.shuffle()
 
 # Load the tokenizer and model
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, padding_side='left')
+tokenizer = AutoTokenizer.from_pretrained(f"./models/{MODEL_NAME.replace('/', '_')}-Corrected", padding_side='left')
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
-model = AutoModelForCausalLM.from_pretrained(f"./models/{MODEL_NAME.replace("/", "_")}", torch_dtype=torch.bfloat16)
+model = AutoModelForCausalLM.from_pretrained(f"./models/{MODEL_NAME.replace('/', '_')}-Corrected", torch_dtype=torch.bfloat16, attn_implementation="flash_attention_2")
 model.cuda()  # Move the model to GPU
 
 # Set the model to evaluation mode

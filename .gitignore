@@ -7,3 +7,4 @@ wandb/
 datasets/
 eval_results/
 .venv
+.venv.eval

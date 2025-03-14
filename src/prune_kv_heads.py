@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import pickle
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM
 from constants import MODEL_NAME, TARGET_NUM_KV_HEADS
 
 def get_head_indices(head_idx, head_dim):
@@ -15,8 +15,7 @@ with open('kv_head_importance_scores_min.pkl', 'rb') as f:
 
 
 
-model = AutoModelForCausalLM.from_pretrained(f"./models/{MODEL_NAME.replace("/", "_")}-Corrected", torch_dtype=torch.bfloat16)
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+model = AutoModelForCausalLM.from_pretrained(f"./models/{MODEL_NAME.replace('/', '_')}-Corrected", torch_dtype=torch.bfloat16)
 model.cpu()
 
 # Update config

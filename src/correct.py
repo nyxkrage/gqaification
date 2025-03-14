@@ -4,12 +4,14 @@ from transformers import (
     AutoTokenizer,
     Trainer,
     TrainingArguments,
-    DataCollatorWithFlattening,
+    get_cosine_schedule_with_warmup
 )
-from accelerate import Accelerator
-from dataset_loader import load_datasets_from_json
-from datasets import Dataset
+from datasets import Dataset, concatenate_datasets
 from constants import MODEL_NAME
+from accelerate import Accelerator
+from lib.muon import Muon
+
+torch._dynamo.config.capture_scalar_outputs = True
 
 def main():
     accelerator = Accelerator()
@@ -19,7 +21,7 @@ def main():
         torch_dtype=torch.bfloat16,
         rope=True,
         rms_norm=True,
-        swiglu=True,
+        swiglu=True
     )
     
     # Load tokenizer
@@ -27,24 +29,58 @@ def main():
     tokenizer.pad_token = tokenizer.eos_token
     
     # Prepare dataset
-    tokenized_dataset = Dataset.load_from_disk("./datasets/correction")
+    tokenized_dataset = concatenate_datasets(
+        [
+            Dataset.load_from_disk("./datasets/dclm_40m"),
+            Dataset.load_from_disk("./datasets/thestack_10m"),
+        ]
+    ).shuffle()
 
-    data_collator = DataCollatorWithFlattening()
+    batch_size = 16
+    num_epochs = 1
+    grad_accum_steps = 1
+    weight_decay = 0.1
+    learning_rate = 4e-4
+    num_devices = accelerator.num_processes
+    warmup_steps = 100
+    steps_per_epoch = len(tokenized_dataset) // batch_size // grad_accum_steps // num_devices
+
+    muon_params = [
+        p
+        for name, p in model.named_parameters()
+        if p.ndim >= 2 and "embed_tokens" not in name and "lm_head" not in name
+    ]
+    adamw_params = [
+        p
+        for name, p in model.named_parameters()
+        if not (
+            p.ndim >= 2 and "embed_tokens" not in name and "lm_head" not in name
+        )
+    ]
+
+    optimizer = Muon(
+        lr=learning_rate,
+        wd=weight_decay,
+        muon_params=muon_params,
+        adamw_params=adamw_params,
+    )
+
+    lr_scheduler = get_cosine_schedule_with_warmup(
+        optimizer=optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=steps_per_epoch * num_epochs,
+    )
 
     # Configure training arguments
     training_args = TrainingArguments(
-        output_dir=f"./models/{MODEL_NAME.replace("/", "_")}-Corrected",
-        learning_rate=4e-4,
-        gradient_accumulation_steps=4,
-        num_train_epochs=1,
-        per_device_train_batch_size=144,
+        output_dir=f"./models/{MODEL_NAME.replace('/', '_')}-Corrected",
+        learning_rate=learning_rate,
+        gradient_accumulation_steps=grad_accum_steps,
+        num_train_epochs=num_epochs,
+        per_device_train_batch_size=batch_size,
         eval_strategy="no",
         logging_steps=1,
-        lr_scheduler_type="cosine",
-        warmup_steps=10,
         bf16=True,
-        weight_decay=0.01,
-        optim="adamw_bnb_8bit",
         gradient_checkpointing=True,
         save_strategy="epoch",
         ddp_find_unused_parameters=False,
@@ -59,12 +95,16 @@ def main():
     trainer = Trainer(
         model=model,
         args=training_args,
-        data_collator=data_collator,
+        optimizers=(optimizer, lr_scheduler),
         train_dataset=tokenized_dataset,
     )
     
     # Start training
     trainer.train()
+    trainer.save_model()
+    if accelerator.is_main_process:
+        tokenizer.save_pretrained(f"./models/{MODEL_NAME.replace('/', '_')}-Corrected")
+    accelerator.wait_for_everyone()
     
 if __name__ == "__main__":
     main()
